@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""news-image-20261117 entry: copy the bundled front-page artwork to
-/output/entry.png, byte-for-byte, and verify it.
+"""Entry point: publish the finished front page to /output/entry.png.
 
-Deterministic: the same input bytes always produce the same output bytes.
-Standard library only; no network access.
+The artwork ships beside this file as artwork.png. This program copies it
+byte-for-byte, then verifies the copy: identical SHA-256, PNG dimensions
+exactly 1024x1024, and size at most 1 MiB. Standard library only, no
+network, fully deterministic — repeated runs write identical bytes.
 """
-
 import hashlib
+import os
+import shutil
 import struct
 import sys
-from pathlib import Path
 
-SOURCE = Path(__file__).resolve().parent / "artwork.png"
-DEST = Path("/output/entry.png")
-MAX_BYTES = 1_048_576
-EXPECTED_SHA256 = "ceded56bf4ce114559c752b4be2d4af10e661ad3efb8e727ce46f062786fdd0c"
-EXPECTED_WIDTH = 1024
-EXPECTED_HEIGHT = 1024
+HERE = os.path.dirname(os.path.abspath(__file__))
+SOURCE = os.path.join(HERE, "artwork.png")
+OUTPUT_DIR = "/output"
+OUTPUT_PATH = os.path.join(OUTPUT_DIR, "entry.png")
+MAX_BYTES = 1024 * 1024
+EXPECTED_SIZE = (1024, 1024)
+# Pinned digest of the shipped artwork. If artwork.png is ever swapped or
+# corrupted, the program refuses to publish instead of emitting bad bytes.
+EXPECTED_SHA256 = "fd989867ddcffe6c61adb584bb9ca8528dd2966b76823ceb454a5dc983c8caa0"
 
 
 def sha256_of(path):
@@ -27,47 +31,48 @@ def sha256_of(path):
     return digest.hexdigest()
 
 
-def png_dimensions(data):
-    """Read width/height from the PNG IHDR chunk (stdlib only)."""
-    if len(data) < 33 or data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ValueError("not a PNG file")
-    if data[12:16] != b"IHDR":
-        raise ValueError("missing PNG IHDR chunk")
-    width, height = struct.unpack(">II", data[16:24])
-    return width, height
+def png_dimensions(path):
+    with open(path, "rb") as handle:
+        header = handle.read(24)
+    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG file: %s" % path)
+    width, height = struct.unpack(">II", header[16:24])
+    return (width, height)
+
+
+def publish():
+    """Validate the artwork, copy it atomically, and verify the result."""
+    if not os.path.isfile(SOURCE) or os.path.islink(SOURCE):
+        raise ValueError("artwork missing or symlinked: %s" % SOURCE)
+    size = os.path.getsize(SOURCE)
+    if size == 0 or size > MAX_BYTES:
+        raise ValueError("artwork size out of bounds: %d bytes" % size)
+    if png_dimensions(SOURCE) != EXPECTED_SIZE:
+        raise ValueError("artwork must be exactly 1024x1024")
+    source_digest = sha256_of(SOURCE)
+    if source_digest != EXPECTED_SHA256:
+        raise ValueError("artwork digest mismatch: %s" % source_digest)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    tmp_path = OUTPUT_PATH + ".tmp"
+    with open(SOURCE, "rb") as src, open(tmp_path, "wb") as dst:
+        shutil.copyfileobj(src, dst, length=65536)
+    os.replace(tmp_path, OUTPUT_PATH)
+    if sha256_of(OUTPUT_PATH) != source_digest:
+        raise ValueError("copy verification failed")
+    if png_dimensions(OUTPUT_PATH) != EXPECTED_SIZE:
+        raise ValueError("output dimensions wrong after copy")
+    return size, source_digest
 
 
 def main():
-    if not SOURCE.is_file():
-        print(f"missing artwork: {SOURCE}", file=sys.stderr)
-        return 1
-    data = SOURCE.read_bytes()
-    if len(data) > MAX_BYTES:
-        print(f"artwork too large: {len(data)} bytes", file=sys.stderr)
-        return 1
-    if hashlib.sha256(data).hexdigest() != EXPECTED_SHA256:
-        print("artwork hash mismatch: bundled artwork was modified",
-              file=sys.stderr)
-        return 1
     try:
-        width, height = png_dimensions(data)
-    except ValueError as exc:
-        print(f"invalid artwork: {exc}", file=sys.stderr)
+        size, digest = publish()
+    except (OSError, ValueError) as exc:
+        print("entry failed: %s" % exc, file=sys.stderr)
         return 1
-    if (width, height) != (EXPECTED_WIDTH, EXPECTED_HEIGHT):
-        print(f"artwork is {width}x{height}, expected "
-              f"{EXPECTED_WIDTH}x{EXPECTED_HEIGHT}", file=sys.stderr)
-        return 1
-    DEST.parent.mkdir(parents=True, exist_ok=True)
-    DEST.write_bytes(data)
-    written = sha256_of(DEST)
-    if written != EXPECTED_SHA256:
-        print("self-check failed: output hash mismatch", file=sys.stderr)
-        return 1
-    print(f"wrote {DEST} ({len(data)} bytes, "
-          f"{width}x{height}, sha256 {written})")
+    print("wrote %s (%d bytes, 1024x1024, sha256 %s)" % (OUTPUT_PATH, size, digest))
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
